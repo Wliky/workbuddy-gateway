@@ -46,3 +46,12 @@ git -c http.proxy=http://127.0.0.1:7890 -c http.version=HTTP/1.1 push origin mai
    （表现为 12153 / 掉登录）。迁移完成后只保留一个在跑。
 5. **GHCR 存在性探测必须带 Accept 头**，否则已存在的 tag 也返回 404，导致每天重复构建。
 6. **镜像名必须全小写**：`github.repository_owner` 是 `Wliky`，要在 step 里 `tr` 成小写。
+7. **别在 `/root` 手动 `docker-compose -f xxx.yml up -d` 重建容器**：CasaOS 判断「哪些应用已安装」
+   靠容器的 label `com.docker.compose.project.config_files`，必须指向
+   `/var/lib/casaos/apps/<app>/docker-compose.yml`。手动在别处 up 会把 label 改成 `/root/...`，
+   面板里这个应用就**消失了**（容器还在跑，但 CasaOS 认为它没装，`DELETE .../compose/<app>` 还返回 404）。
+   正确做法：改完 compose 走 `POST /v2/app_management/compose` 重新导入；真要重建就在
+   `/var/lib/casaos/apps/<app>/` 目录内 `docker-compose up -d`。
+8. **重新导入前要先清干净**：同名容器占着端口会让导入报 `400 there are ports in use`；
+   先 `docker rm -f <container>` + 删 `/var/lib/casaos/apps/<app>` 再导入（`/DATA/AppData` 不要动，账号在里面）。
+9. 容器要带 `labels: icon:`，CasaOS 的图标来自容器 label，不是只看 `x-casaos.icon`。

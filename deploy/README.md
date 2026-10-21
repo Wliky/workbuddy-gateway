@@ -35,6 +35,14 @@ curl -s -X POST -H 'Content-Type: application/yaml' \
 
 `Content-Type` 必须是 `application/yaml`，别的写法会被 CasaOS 拒绝。
 
+> **不要**在 `/root` 手动 `docker-compose -f xxx.yml up -d` 重建容器：CasaOS 靠容器 label
+> `com.docker.compose.project.config_files` 识别已安装应用，指到 `/root` 就会从面板里消失
+> （容器还在跑，但 `DELETE .../compose/<app>` 返回 404）。要重建就在
+> `/var/lib/casaos/apps/workbuddy-gateway/` 目录内执行，或直接重新导入 compose。
+>
+> 重新导入前先 `docker rm -f workbuddy-gateway` 并删掉 `/var/lib/casaos/apps/<app>`，
+> 否则报 `400 there are ports in use`；`/DATA/AppData` 不要动，账号在里面。
+
 卸载：`curl -s -X DELETE http://127.0.0.1/v2/app_management/compose/workbuddy-gateway`
 （只删应用，不动 `/DATA/AppData/workbuddy-gateway`）。
 
