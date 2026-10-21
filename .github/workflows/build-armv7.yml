@@ -162,35 +162,58 @@ jobs:
 
       - name: 校验镜像架构
         if: steps.gate.outputs.skip != 'true'
+        env:
+          IMAGE: ${{ steps.img.outputs.image }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
           set -euo pipefail
-          IMAGE='${{ steps.img.outputs.image }}'
-          TAG='${{ steps.ver.outputs.tag }}'
           docker buildx imagetools inspect "${IMAGE}:${TAG}"
-          # 单平台构建产出 image manifest（没有 manifests 数组），多平台才是 index。
-          # 两种都从 --raw 取，避免 --format 模板在不同 buildx 版本上字段不一致。
-          PLATFORM="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --raw | python3 -c '
-          import json,sys
-          d=json.load(sys.stdin)
-          if "manifests" in d:
-              p=d["manifests"][0].get("platform",{})
-          else:
-              p={"os":d.get("os",""),"architecture":d.get("architecture",""),"variant":d.get("variant","")}
-          os_,arch,var=p.get("os",""),p.get("architecture",""),p.get("variant","")
-          print(f"{os_}/{arch}"+(f"/{var}" if var else ""))
-          ')"
-          echo "架构: ${PLATFORM:-unknown}"
-          if [ "${PLATFORM:-}" != "linux/arm/v7" ]; then
-            echo "::error::构建产物架构不是 linux/arm/v7（拿到 ${PLATFORM:-空}）"
-            exit 1
-          fi
-          {
-            echo "## armv7 镜像已推送"
-            echo ""
-            echo "- 上游版本：\`${TAG}\`"
-            echo "- 镜像：\`${IMAGE}:armv7\` / \`:${TAG}\` / \`:latest\`"
-            echo "- 架构：linux/arm/v7（GOARM=7）"
-          } >> "$GITHUB_STEP_SUMMARY"
+          # 注意：单架构 OCI image manifest 的顶层**没有** architecture 字段，
+          # 架构信息在 config blob 里（schema v2 image manifest 也一样）。
+          # 所以这里直接走 registry API：index → per-arch manifest → config blob。
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+
+          image, tag = os.environ['IMAGE'], os.environ['TAG']
+          repo = image.split('ghcr.io/', 1)[1]
+          ACC = ','.join([
+              'application/vnd.oci.image.index.v1+json',
+              'application/vnd.docker.distribution.manifest.list.v2+json',
+              'application/vnd.oci.image.manifest.v1+json',
+              'application/vnd.docker.distribution.manifest.v2+json',
+          ])
+
+          def token():
+              url = f'https://ghcr.io/token?scope=repository:{repo}:pull&service=ghcr.io'
+              with urllib.request.urlopen(url, timeout=30) as r:
+                  return json.load(r)['token']
+
+          def gh(path, bearer):
+              req = urllib.request.Request(
+                  f'https://ghcr.io/v2/{repo}/{path}',
+                  headers={'Authorization': 'Bearer ' + bearer, 'Accept': ACC,
+                           'User-Agent': 'wb-armv7-ci'})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
+          bearer = token()
+          man = gh(f'manifests/{tag}', bearer)
+          if 'manifests' in man:                      # 多架构：先取第一个子 manifest
+              man = gh(f"manifests/{man['manifests'][0]['digest']}", bearer)
+          cfg = gh('blobs/' + man['config']['digest'], bearer)
+
+          platform = f"{cfg.get('os','')}/{cfg.get('architecture','')}"
+          if cfg.get('variant'):
+              platform += f"/{cfg['variant']}"
+          print('架构:', platform)
+          if platform != 'linux/arm/v7':
+              sys.exit(f'::error::架构不符，期望 linux/arm/v7，实际 {platform}')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write('## armv7 镜像已推送\n\n'
+                      f'- 上游版本：`{tag}`\n'
+                      f'- 镜像：`{image}:armv7` / `:{tag}` / `:latest`\n'
+                      f'- 架构：`{platform}`（GOARM=7）\n')
+          PY
 
       - name: 跳过说明
         if: steps.gate.outputs.skip == 'true'
