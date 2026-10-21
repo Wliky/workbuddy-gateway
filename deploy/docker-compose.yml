@@ -1,0 +1,59 @@
+# workbuddy-gateway — CasaOS / 玩客云（armv7）部署定义
+#
+# 导入：curl -s -X POST -H 'Content-Type: application/yaml' \
+#         --data-binary @docker-compose.yml http://127.0.0.1/v2/app_management/compose
+#
+# 三个要点：
+#   1. image 用 :latest → watchtower 会自动跟进上游发版（CI 每天查一次上游 release）。
+#      要锁版本就把 image 钉成 :v1.14.21，这也是回滚手段。
+#   2. 必须 -addr 0.0.0.0：程序默认监听 127.0.0.1，容器内监听回环则宿主机访问不到。
+#   3. 所有状态（config.json / workbuddy*.json 凭据 / logs/）都在 /data 一个卷里，
+#      重建容器不丢账号。
+name: workbuddy-gateway
+services:
+    workbuddy-gateway:
+        container_name: workbuddy-gateway
+        image: ghcr.io/wliky/workbuddy-gateway:latest
+        command: [serve, -addr, 0.0.0.0, -webui]
+        ports:
+            - target: 8317
+              published: "8317"
+              protocol: tcp
+            - target: 8316
+              published: "8316"
+              protocol: tcp
+        volumes:
+            - type: bind
+              source: /DATA/AppData/workbuddy-gateway
+              target: /data
+        environment:
+            TZ: Asia/Shanghai
+        restart: unless-stopped
+        hostname: workbuddy-gateway
+        healthcheck:
+            test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8317/health"]
+            interval: 30s
+            timeout: 5s
+            retries: 3
+            start_period: 20s
+        deploy:
+            resources:
+                limits:
+                    memory: "268435456"
+x-casaos:
+    author: self
+    category: self
+    description:
+        en_us: WorkBuddy gateway (OpenAI/Anthropic compatible, arm/v7)
+        zh_cn: WorkBuddy 本地网关（OpenAI / Anthropic 兼容，账号池，32 位 ARM）
+    icon: https://download.codebuddy.cn/web/workbuddy/93a7cd0d70556625552d16b09c6a9cf8c2e089b9/assets/logo.svg
+    index: /ui/
+    is_uncontrolled: false
+    main: workbuddy-gateway
+    port_map: "8316"
+    scheme: http
+    store_app_id: workbuddy-gateway
+    title:
+        custom: ""
+        en_us: WorkBuddy Gateway
+        zh_cn: WorkBuddy 网关

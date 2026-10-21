@@ -1,0 +1,188 @@
+name: build-armv7
+
+# 上游 CangShui/workbuddy-gateway 只发 amd64/arm64/386 之外的常规产物，
+# 虽然有 linux-armv7 二进制，但没有镜像；这里自建 armv7 镜像给玩客云用。
+#
+# 触发：
+#   * push（只改了 deploy/** 或本文件）
+#   * 每天 04:00 UTC 查上游最新 release，有新版才构建（已存在同 tag 镜像则跳过）
+#   * 手动 dispatch：可指定 tag、可 force 重建
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/build-armv7.yml'
+  schedule:
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '上游 release tag（留空=用最新）'
+        required: false
+        default: ''
+      force:
+        description: '镜像已存在也强制重建'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-armv7-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 解析镜像名（必须全小写）
+        id: img
+        run: |
+          OWNER="$(printf '%s' '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image=ghcr.io/${OWNER}/workbuddy-gateway" >> "$GITHUB_OUTPUT"
+          echo "镜像: ghcr.io/${OWNER}/workbuddy-gateway"
+
+      - name: 解析上游版本
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-}"
+          if [ -z "$TAG" ]; then
+            API="https://api.github.com/repos/CangShui/workbuddy-gateway/releases/latest"
+            BODY="$(curl -sS --retry 3 --retry-delay 2 \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'User-Agent: wb-armv7-ci' "$API")" || BODY=""
+            TAG="$(printf '%s' "$BODY" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+          fi
+          if [ -z "$TAG" ]; then
+            echo "::error::无法解析上游最新版本，手动指定 tag 重试"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "上游版本: $TAG"
+
+      - name: 检查 GHCR 是否已有该 tag
+        id: gate
+        env:
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -uo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          TAG='${{ steps.ver.outputs.tag }}'
+          REPO="${IMAGE#ghcr.io/}"
+          FORCE="${FORCE:-false}"
+          # 失败开放：任何异常都按「不存在」处理，最多多构建一次
+          SKIP=false
+          if [ "$FORCE" != "true" ]; then
+            TOKEN="$(curl -sS --max-time 20 \
+              "https://ghcr.io/token?scope=repository:${REPO}:pull&service=ghcr.io" \
+              | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            if [ -n "${TOKEN:-}" ]; then
+              ACC='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+              CODE="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 20 \
+                -H "Authorization: Bearer $TOKEN" -H "Accept: $ACC" \
+                "https://ghcr.io/v2/${REPO}/manifests/${TAG}" || echo 000)"
+              echo "manifest 探测: HTTP $CODE"
+              if [ "$CODE" = "200" ]; then SKIP=true; fi
+            fi
+          else
+            echo "force 指定，跳过去重"
+          fi
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          if [ "$SKIP" = "true" ]; then echo "${IMAGE}:${TAG} 已存在，跳过构建"; fi
+
+      - name: 检出上游源码
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: CangShui/workbuddy-gateway
+          ref: ${{ steps.ver.outputs.tag }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: 检出自有构建文件
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/checkout@v4
+        with:
+          path: self
+          fetch-depth: 1
+
+      - name: 注入 deploy 目录
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          cp -a self/deploy upstream/deploy
+          ls -l upstream/deploy
+
+      - name: 读取 go.mod 的 Go 版本
+        id: go
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          FULL="$(awk '/^go[[:space:]]/{print $2; exit}' upstream/go.mod)"
+          MINOR="${FULL%.*}"
+          echo "version=$MINOR" >> "$GITHUB_OUTPUT"
+          echo "go.mod 要求 $FULL → 使用 golang:${MINOR}-alpine"
+
+      - name: Set up Buildx
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送 armv7 镜像
+        id: build
+        if: steps.gate.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/deploy/Dockerfile
+          platforms: linux/arm/v7
+          push: true
+          provenance: false
+          build-args: |
+            GO_VERSION=${{ steps.go.outputs.version }}
+          tags: |
+            ${{ steps.img.outputs.image }}:armv7
+            ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.tag }}
+            ${{ steps.img.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 校验镜像架构
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          TAG='${{ steps.ver.outputs.tag }}'
+          docker buildx imagetools inspect "${IMAGE}:${TAG}"
+          ARCH="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' \
+            | sed -n 's/.*"architecture":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+          echo "架构: ${ARCH:-unknown}"
+          if [ "${ARCH:-}" != "arm" ]; then
+            echo "::error::构建产物架构不是 arm（拿到 ${ARCH:-空}）"
+            exit 1
+          fi
+          {
+            echo "## armv7 镜像已推送"
+            echo ""
+            echo "- 上游版本：\`${TAG}\`"
+            echo "- 镜像：\`${IMAGE}:armv7\` / \`:${TAG}\` / \`:latest\`"
+            echo "- 架构：linux/arm/v7（GOARM=7）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 跳过说明
+        if: steps.gate.outputs.skip == 'true'
+        run: |
+          echo "上游 ${{ steps.ver.outputs.tag }} 的镜像已存在，本次不构建。" >> "$GITHUB_STEP_SUMMARY"
