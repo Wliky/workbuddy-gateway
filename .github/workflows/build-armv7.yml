@@ -167,11 +167,21 @@ jobs:
           IMAGE='${{ steps.img.outputs.image }}'
           TAG='${{ steps.ver.outputs.tag }}'
           docker buildx imagetools inspect "${IMAGE}:${TAG}"
-          ARCH="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --format '{{json .Manifest}}' \
-            | sed -n 's/.*"architecture":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-          echo "架构: ${ARCH:-unknown}"
-          if [ "${ARCH:-}" != "arm" ]; then
-            echo "::error::构建产物架构不是 arm（拿到 ${ARCH:-空}）"
+          # 单平台构建产出 image manifest（没有 manifests 数组），多平台才是 index。
+          # 两种都从 --raw 取，避免 --format 模板在不同 buildx 版本上字段不一致。
+          PLATFORM="$(docker buildx imagetools inspect "${IMAGE}:${TAG}" --raw | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)
+          if "manifests" in d:
+              p=d["manifests"][0].get("platform",{})
+          else:
+              p={"os":d.get("os",""),"architecture":d.get("architecture",""),"variant":d.get("variant","")}
+          os_,arch,var=p.get("os",""),p.get("architecture",""),p.get("variant","")
+          print(f"{os_}/{arch}"+(f"/{var}" if var else ""))
+          ')"
+          echo "架构: ${PLATFORM:-unknown}"
+          if [ "${PLATFORM:-}" != "linux/arm/v7" ]; then
+            echo "::error::构建产物架构不是 linux/arm/v7（拿到 ${PLATFORM:-空}）"
             exit 1
           fi
           {
